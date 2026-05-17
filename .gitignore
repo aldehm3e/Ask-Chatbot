@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+.vs/
+build/
+
+# PyInstaller output. Rebuild it locally when you need a fresh .exe.
+dist/

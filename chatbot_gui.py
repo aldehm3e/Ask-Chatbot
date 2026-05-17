@@ -1,82 +1,202 @@
 import os
+import re
+import shutil
+import subprocess
 import sys
+
 import fitz  # PyMuPDF for PDF processing
-import subprocess  # For running Ollama locally
+from PyQt5.QtCore import QPoint, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit, QFileDialog, QLabel, QProgressBar,
-    QMenuBar, QAction, QMessageBox, QScrollArea
+    QAction,
+    QApplication,
+    QFileDialog,
+    QLabel,
+    QMenuBar,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtGui import QIcon
-from PyQt5.QtCore import Qt
 
-# Windows-specific imports for taskbar icon
-if sys.platform == "win32":
-    from PyQt5.QtWinExtras import QtWin
 
-# Function to get the correct path for PyInstaller
-def resource_path(relative_path):
-    """ Get the absolute path to a resource (useful for PyInstaller). """
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+ANSI_ESCAPE_RE = re.compile(r"[\x1b\x9b\u2039]\[[0-?]*[ -/]*[@-~]")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def set_windows_app_id(app_id):
+    if sys.platform != "win32":
+        return
+
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
+def create_app_icon():
+    """Creates a local PDF/chat icon without requiring an image file."""
+    pixmap = QPixmap(128, 128)
+    pixmap.fill(Qt.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    background = QPainterPath()
+    background.addRoundedRect(8, 8, 112, 112, 24, 24)
+    painter.fillPath(background, QColor("#2457A6"))
+
+    document = QPainterPath()
+    document.moveTo(38, 24)
+    document.lineTo(78, 24)
+    document.lineTo(96, 42)
+    document.lineTo(96, 94)
+    document.quadTo(96, 102, 88, 102)
+    document.lineTo(38, 102)
+    document.quadTo(30, 102, 30, 94)
+    document.lineTo(30, 32)
+    document.quadTo(30, 24, 38, 24)
+    painter.fillPath(document, QColor("#FFFFFF"))
+
+    fold = QPainterPath()
+    fold.moveTo(78, 24)
+    fold.lineTo(96, 42)
+    fold.lineTo(82, 42)
+    fold.quadTo(78, 42, 78, 38)
+    fold.closeSubpath()
+    painter.fillPath(fold, QColor("#CFE0FF"))
+
+    painter.setPen(QPen(QColor("#2457A6"), 5, Qt.SolidLine, Qt.RoundCap))
+    painter.drawLine(44, 54, 78, 54)
+    painter.drawLine(44, 68, 82, 68)
+    painter.drawLine(44, 82, 66, 82)
+
+    bubble = QPainterPath()
+    bubble.addRoundedRect(58, 70, 48, 34, 12, 12)
+    bubble.moveTo(72, 100)
+    bubble.lineTo(62, 112)
+    bubble.lineTo(84, 102)
+    painter.fillPath(bubble, QColor("#31C48D"))
+
+    painter.setPen(QPen(QColor("#FFFFFF"), 5, Qt.SolidLine, Qt.RoundCap))
+    painter.drawPoint(QPoint(72, 87))
+    painter.drawPoint(QPoint(84, 87))
+    painter.drawPoint(QPoint(96, 87))
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+def clean_model_response(text):
+    """Removes model reasoning tags and terminal control characters."""
+    text = ANSI_ESCAPE_RE.sub("", text)
+    text = THINK_BLOCK_RE.sub("", text)
+    text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
+    text = CONTROL_CHAR_RE.sub("", text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    return "\n".join(lines).strip() or "Error: No response from AI."
+
+
+class QuestionTextEdit(QTextEdit):
+    submitted = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() == Qt.NoModifier:
+            self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class OllamaWorker(QThread):
+    """Runs the local Ollama command without freezing the PyQt window."""
+
+    response_ready = pyqtSignal(str)
+
+    def __init__(self, prompt, parent=None):
+        super().__init__(parent)
+        self.prompt = prompt
+
+    def run(self):
+        self.response_ready.emit(self.run_ollama(self.prompt))
+
+    def run_ollama(self, prompt):
+        if not shutil.which("ollama"):
+            return "Error: Ollama was not found. Please install Ollama and make sure it is in your PATH."
+
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            result = subprocess.run(
+                ["ollama", "run", "deepseek-r1:1.5b"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                timeout=300,
+            )
+
+            if result.returncode != 0:
+                error = result.stderr.strip() or "Ollama exited without an error message."
+                return f"Error running Ollama: {error}"
+
+            return clean_model_response(result.stdout)
+        except subprocess.TimeoutExpired:
+            return "Error: Ollama took more than 5 minutes to respond."
+        except Exception as e:
+            return f"Error running Ollama: {e}"
+
 
 class ChatbotApp(QWidget):
-    def __init__(self):
+    def __init__(self, app_icon=None):
         super().__init__()
 
-        # Set window properties
         self.setWindowTitle("Ask Chatbot V1.5")
         self.setGeometry(100, 100, 600, 500)
+        self.app_icon = app_icon or create_app_icon()
+        self.setWindowIcon(self.app_icon)
 
-        # Set application and taskbar icon
-        app_icon = QIcon(resource_path("AIS1.ico"))
-        self.setWindowIcon(app_icon)
-
-        # Explicitly set taskbar icon for Windows
-        if sys.platform == "win32":
-            app_id = "chatbot.app.v1"  # Unique app ID
-            QtWin.setCurrentProcessExplicitAppUserModelID(app_id)
-
-        # Create layout
         self.layout = QVBoxLayout()
         self.create_menu_bar()
 
-        # Create a button to upload PDFs
-        self.upload_button = QPushButton("📂 Upload PDF(s)")
+        self.upload_button = QPushButton("Upload PDF(s)")
         self.upload_button.setStyleSheet("background-color: white; color: black;")
         self.upload_button.clicked.connect(self.upload_pdf)
 
-        # Create a button to show the extracted PDF text
-        self.show_text_button = QPushButton("📄 Show Extracted Text")
+        self.show_text_button = QPushButton("Show Extracted Text")
         self.show_text_button.setStyleSheet("background-color: white; color: black;")
         self.show_text_button.clicked.connect(self.show_extracted_text)
 
-        # Create a text area for user input
-        self.question_box = QTextEdit()
-        self.question_box.setPlaceholderText("✍ Type your question here...")
+        self.question_box = QuestionTextEdit()
+        self.question_box.setPlaceholderText("Type your question here. Press Enter to ask, Shift+Enter for a new line.")
+        self.question_box.submitted.connect(self.ask_chatbot)
 
-        # Create a button to ask the chatbot
-        self.ask_button = QPushButton("🤖 Ask Chatbot")
+        self.ask_button = QPushButton("Ask Chatbot")
         self.ask_button.setStyleSheet("background-color: white; color: black;")
         self.ask_button.clicked.connect(self.ask_chatbot)
 
-        # Create a progress bar (hidden by default)
         self.progress_bar = QProgressBar()
         self.progress_bar.setAlignment(Qt.AlignCenter)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
 
-        # Create a label to display responses
-        self.response_label = QLabel("💬 Chatbot Response will appear here.")
+        self.response_label = QLabel("Chatbot response will appear here.")
+        self.response_label.setTextFormat(Qt.PlainText)
         self.response_label.setWordWrap(True)
-        self.response_label.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        self.response_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.response_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        # Wrap the response label in a scroll area
         self.scroll_area = QScrollArea(self)
         self.scroll_area.setWidget(self.response_label)
         self.scroll_area.setWidgetResizable(True)
 
-        # Add widgets to layout
         self.layout.addWidget(self.upload_button)
         self.layout.addWidget(self.show_text_button)
         self.layout.addWidget(self.question_box)
@@ -84,27 +204,26 @@ class ChatbotApp(QWidget):
         self.layout.addWidget(self.progress_bar)
         self.layout.addWidget(self.scroll_area)
 
-        # Set layout
         self.setLayout(self.layout)
 
-        # Store extracted PDF text
         self.pdf_text = ""
+        self.pdf_files = []
+        self.ollama_worker = None
 
     def create_menu_bar(self):
-        """Creates the menu bar with an About button."""
         menu_bar = QMenuBar(self)
         menu_bar.setStyleSheet(
             """
             QMenuBar {
-                background-color: white;  
-                color: black;  
+                background-color: white;
+                color: black;
             }
             QMenuBar::item:selected {
-                background: #e0e0e0;  
+                background: #e0e0e0;
             }
             QMenu {
-                background-color: white;  
-                color: black;  
+                background-color: white;
+                color: black;
             }
             QMenu::item:selected {
                 background-color: #e0e0e0;
@@ -112,87 +231,132 @@ class ChatbotApp(QWidget):
             """
         )
 
+        help_menu = menu_bar.addMenu("Help")
         about_action = QAction("About", self)
+        about_action.setShortcut("F1")
         about_action.triggered.connect(self.show_about_dialog)
-        menu_bar.addAction(about_action)
+        help_menu.addAction(about_action)
         self.layout.setMenuBar(menu_bar)
 
     def show_about_dialog(self):
-        """Displays the About dialog."""
         about_dialog = QMessageBox(self)
         about_dialog.setWindowTitle("About")
-        about_dialog.setTextFormat(Qt.RichText)
-        about_dialog.setText(
-            "<center>Ask Chatbot🤖 V1.5<br>"
-            "by Eng. Abdulrahman Alsaedi<br>"
-            "Islamic University of Medina</center>"
+        about_dialog.setWindowIcon(self.app_icon)
+        about_dialog.setIconPixmap(self.app_icon.pixmap(64, 64))
+        about_dialog.setTextFormat(Qt.PlainText)
+        about_dialog.setText("Ask Chatbot V1.5")
+        about_dialog.setInformativeText(
+            "by Eng. Abdulrahman Alsaedi\n"
+            "Islamic University of Medina\n\n"
+            "A local PDF question-answering chatbot powered by Ollama."
         )
         about_dialog.setStandardButtons(QMessageBox.Ok)
         about_dialog.exec_()
 
     def upload_pdf(self):
-        """Opens a file dialog for selecting PDFs and extracts text."""
         file_dialog = QFileDialog()
         file_paths, _ = file_dialog.getOpenFileNames(self, "Select PDF Files", "", "PDF Files (*.pdf)")
 
         if file_paths:
             self.pdf_text = ""
+            self.pdf_files = []
+            total_pages = 0
+            errors = []
             for pdf_file in file_paths:
-                text = self.extract_text_from_pdf(pdf_file)
-                self.pdf_text += text + "\n\n"
-            self.response_label.setText("✅ PDF text extracted successfully! You can now ask questions.")
+                text, page_count, error = self.extract_text_from_pdf(pdf_file)
+                total_pages += page_count
+                self.pdf_files.append(os.path.basename(pdf_file))
+                if error:
+                    errors.append(error)
+                if text:
+                    self.pdf_text += f"File: {os.path.basename(pdf_file)}\n{text}\n\n"
 
-    def extract_text_from_pdf(self, pdf_path):
-        """Extracts text from a given PDF file."""
+            extracted_chars = len(self.pdf_text.strip())
+            if extracted_chars:
+                message = (
+                    f"PDF text extracted successfully.\n"
+                    f"Files: {len(file_paths)} | Pages: {total_pages} | Characters: {extracted_chars}\n"
+                    "You can now ask questions."
+                )
+            else:
+                message = (
+                    f"No selectable text was found.\n"
+                    f"Files: {len(file_paths)} | Pages: {total_pages}\n"
+                    "If this PDF is scanned or image-only, it needs OCR before the chatbot can read it."
+                )
+
+            if errors:
+                message += "\n\nProblems:\n" + "\n".join(errors)
+
+            self.response_label.setText(message)
+
+    @staticmethod
+    def extract_text_from_pdf(pdf_path):
+        doc = None
         try:
             doc = fitz.open(pdf_path)
-            text = "".join([page.get_text() + "\n" for page in doc])
-            return text
+            page_count = doc.page_count
+            text = "\n".join(page.get_text("text").strip() for page in doc).strip()
+            return text, page_count, None
         except Exception as e:
-            return f"⚠️ Error reading {pdf_path}: {e}"
+            return "", 0, f"Error reading {os.path.basename(pdf_path)}: {e}"
+        finally:
+            if doc is not None:
+                doc.close()
 
     def show_extracted_text(self):
-        """Displays the extracted text."""
         if not self.pdf_text:
-            self.response_label.setText("⚠️ No text extracted from the PDF yet.")
+            self.response_label.setText("No text extracted from a PDF yet.")
             return
         self.response_label.setText(self.pdf_text)
 
     def ask_chatbot(self):
-        """Runs DeepSeek-R1:1.5B locally using Ollama."""
-        user_question = self.question_box.toPlainText()
-        if not self.pdf_text:
-            self.response_label.setText("⚠️ Please upload a PDF first.")
+        if self.ollama_worker is not None:
             return
+
+        user_question = self.question_box.toPlainText().strip()
         if not user_question:
-            self.response_label.setText("⚠️ Please enter a question.")
+            self.response_label.setText("Please enter a question.")
             return
 
         self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(50)
+        self.progress_bar.setRange(0, 0)
+        self.ask_button.setEnabled(False)
+        self.response_label.setText("Thinking...")
 
-        full_prompt = f"Context:\n{self.pdf_text}\n\nQuestion: {user_question}\nAnswer:"
-        response = self.run_ollama(full_prompt)
-
-        self.progress_bar.setVisible(False)
-        self.response_label.setText(f"💡 {response}")
-
-    def run_ollama(self, prompt):
-        """Runs DeepSeek-R1:1.5B locally using Ollama CLI."""
-        try:
-            result = subprocess.run(
-                ["ollama", "run", "deepseek-r1:1.5b", prompt],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                creationflags=subprocess.CREATE_NO_WINDOW  # Hide the CMD terminal
+        if self.pdf_text:
+            full_prompt = (
+                "Use the PDF context below to answer the question.\n"
+                "Answer in English only unless the user asks for another language.\n"
+                "Give the final answer only. Do not include <think> tags or hidden reasoning.\n\n"
+                f"PDF context:\n{self.pdf_text}\n\nQuestion: {user_question}\nAnswer:"
             )
-            return result.stdout if result.stdout else "⚠️ Error: No response from AI."
-        except Exception as e:
-            return f"⚠️ Error running Ollama: {e}"
+        else:
+            full_prompt = (
+                "Answer in English only unless the user asks for another language.\n"
+                "Give the final answer only. Do not include <think> tags or hidden reasoning.\n\n"
+                f"Question: {user_question}\nAnswer:"
+            )
+
+        self.question_box.clear()
+        self.ollama_worker = OllamaWorker(full_prompt, self)
+        self.ollama_worker.response_ready.connect(self.display_chatbot_response)
+        self.ollama_worker.start()
+
+    def display_chatbot_response(self, response):
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.ask_button.setEnabled(True)
+        self.response_label.setText(f"Response:\n{response}")
+        self.ollama_worker = None
+
 
 if __name__ == "__main__":
+    set_windows_app_id("chatbot.app.v1")
     app = QApplication(sys.argv)
-    window = ChatbotApp()
+    app_icon = create_app_icon()
+    app.setWindowIcon(app_icon)
+    window = ChatbotApp(app_icon)
     window.show()
     sys.exit(app.exec_())
