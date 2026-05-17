@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 import fitz  # PyMuPDF for PDF processing
-from PyQt5.QtCore import QPoint, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QPoint, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
 ANSI_ESCAPE_RE = re.compile(r"[\x1b\x9b\u2039]\[[0-?]*[ -/]*[@-~]")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+MAX_HISTORY_TURNS = 8
 
 
 def set_windows_app_id(app_id):
@@ -99,8 +100,21 @@ def clean_model_response(text):
     text = THINK_BLOCK_RE.sub("", text)
     text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
     text = CONTROL_CHAR_RE.sub("", text)
-    lines = [line.rstrip() for line in text.splitlines()]
-    return "\n".join(lines).strip() or "Error: No response from AI."
+    lines = []
+    for line in text.splitlines():
+        line = line.rstrip()
+        if lines and line:
+            previous_word = re.search(r"(\w{1,16})$", lines[-1], flags=re.UNICODE)
+            first_word = re.match(r"(\w{1,32})", line, flags=re.UNICODE)
+            if (
+                previous_word
+                and first_word
+                and first_word.group(1).casefold().startswith(previous_word.group(1).casefold())
+                and first_word.group(1).casefold() != previous_word.group(1).casefold()
+            ):
+                lines[-1] = lines[-1][: -len(previous_word.group(1))].rstrip()
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 class QuestionTextEdit(QTextEdit):
@@ -126,28 +140,51 @@ class OllamaWorker(QThread):
     def run(self):
         self.response_ready.emit(self.run_ollama(self.prompt))
 
+    @staticmethod
+    def call_ollama(prompt):
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        return subprocess.run(
+            ["ollama", "run", "deepseek-r1:1.5b"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+            timeout=300,
+        )
+
     def run_ollama(self, prompt):
         if not shutil.which("ollama"):
             return "Error: Ollama was not found. Please install Ollama and make sure it is in your PATH."
 
         try:
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            result = subprocess.run(
-                ["ollama", "run", "deepseek-r1:1.5b"],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=creationflags,
-                timeout=300,
-            )
+            result = self.call_ollama(prompt)
 
             if result.returncode != 0:
                 error = result.stderr.strip() or "Ollama exited without an error message."
                 return f"Error running Ollama: {error}"
 
-            return clean_model_response(result.stdout)
+            response = clean_model_response(result.stdout)
+            if response:
+                return response
+
+            retry_prompt = (
+                f"{prompt}\n\n"
+                "The previous model output did not include a usable final answer. "
+                "Reply now with a concise final answer only, without reasoning tags."
+            )
+            retry_result = self.call_ollama(retry_prompt)
+
+            if retry_result.returncode != 0:
+                error = retry_result.stderr.strip() or "Ollama exited without an error message."
+                return f"Error running Ollama: {error}"
+
+            retry_response = clean_model_response(retry_result.stdout)
+            if retry_response:
+                return retry_response
+
+            return "Error: The AI returned an empty final answer. Please try asking again."
         except subprocess.TimeoutExpired:
             return "Error: Ollama took more than 5 minutes to respond."
         except Exception as e:
@@ -208,6 +245,8 @@ class ChatbotApp(QWidget):
 
         self.pdf_text = ""
         self.pdf_files = []
+        self.chat_history = []
+        self.pending_question = ""
         self.ollama_worker = None
 
     def create_menu_bar(self):
@@ -260,6 +299,8 @@ class ChatbotApp(QWidget):
         if file_paths:
             self.pdf_text = ""
             self.pdf_files = []
+            self.chat_history = []
+            self.pending_question = ""
             total_pages = 0
             errors = []
             for pdf_file in file_paths:
@@ -276,7 +317,7 @@ class ChatbotApp(QWidget):
                 message = (
                     f"PDF text extracted successfully.\n"
                     f"Files: {len(file_paths)} | Pages: {total_pages} | Characters: {extracted_chars}\n"
-                    "You can now ask questions."
+                    "You can now ask questions. Chat history has been reset for this PDF set."
                 )
             else:
                 message = (
@@ -289,6 +330,7 @@ class ChatbotApp(QWidget):
                 message += "\n\nProblems:\n" + "\n".join(errors)
 
             self.response_label.setText(message)
+            self.scroll_response_to_bottom()
 
     @staticmethod
     def extract_text_from_pdf(pdf_path):
@@ -307,11 +349,68 @@ class ChatbotApp(QWidget):
     def show_extracted_text(self):
         if not self.pdf_text:
             self.response_label.setText("No text extracted from a PDF yet.")
+            self.scroll_response_to_bottom()
             return
         self.response_label.setText(self.pdf_text)
+        self.scroll_response_to_bottom()
+
+    @staticmethod
+    def is_error_response(response):
+        return response.startswith("Error:")
+
+    def scroll_response_to_bottom(self):
+        QTimer.singleShot(0, self._scroll_response_to_bottom)
+        QTimer.singleShot(50, self._scroll_response_to_bottom)
+
+    def _scroll_response_to_bottom(self):
+        scrollbar = self.scroll_area.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def format_chat_history(self, pending_question=None, pending_response=None):
+        parts = []
+        for role, message in self.chat_history:
+            label = "You" if role == "user" else "Chatbot"
+            parts.append(f"{label}:\n{message}")
+
+        if pending_question:
+            parts.append(f"You:\n{pending_question}")
+        if pending_response:
+            parts.append(f"Chatbot:\n{pending_response}")
+
+        return "\n\n".join(parts) or "Chatbot response will appear here."
+
+    def format_prompt_history(self):
+        recent_history = self.chat_history[-MAX_HISTORY_TURNS * 2 :]
+        lines = []
+        for role, message in recent_history:
+            label = "User" if role == "user" else "Assistant"
+            lines.append(f"{label}: {message}")
+        return "\n".join(lines)
+
+    def build_prompt(self, user_question):
+        instructions = (
+            "Answer the user's current question naturally and directly.\n"
+            "Use the recent conversation when it helps answer follow-up questions.\n"
+            "If PDF context is provided, use it when it is relevant.\n"
+            "Give the final answer only. Do not include <think> tags or hidden reasoning."
+        )
+        history = self.format_prompt_history()
+
+        prompt_parts = [instructions]
+        if self.pdf_text:
+            prompt_parts.append(f"PDF context:\n{self.pdf_text.strip()}")
+        if history:
+            prompt_parts.append(f"Recent conversation:\n{history}")
+        prompt_parts.append(f"Current question: {user_question}\nAnswer:")
+
+        return "\n\n".join(prompt_parts)
 
     def ask_chatbot(self):
         if self.ollama_worker is not None:
+            self.response_label.setText(
+                self.format_chat_history(self.pending_question, "Still thinking. Please wait for this answer to finish.")
+            )
+            self.scroll_response_to_bottom()
             return
 
         user_question = self.question_box.toPlainText().strip()
@@ -322,22 +421,12 @@ class ChatbotApp(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.ask_button.setEnabled(False)
-        self.response_label.setText("Thinking...")
+        self.question_box.setEnabled(False)
+        self.pending_question = user_question
+        self.response_label.setText(self.format_chat_history(user_question, "Thinking..."))
+        self.scroll_response_to_bottom()
 
-        if self.pdf_text:
-            full_prompt = (
-                "Use the PDF context below to answer the question.\n"
-                "Answer in English only unless the user asks for another language.\n"
-                "Give the final answer only. Do not include <think> tags or hidden reasoning.\n\n"
-                f"PDF context:\n{self.pdf_text}\n\nQuestion: {user_question}\nAnswer:"
-            )
-        else:
-            full_prompt = (
-                "Answer in English only unless the user asks for another language.\n"
-                "Give the final answer only. Do not include <think> tags or hidden reasoning.\n\n"
-                f"Question: {user_question}\nAnswer:"
-            )
-
+        full_prompt = self.build_prompt(user_question)
         self.question_box.clear()
         self.ollama_worker = OllamaWorker(full_prompt, self)
         self.ollama_worker.response_ready.connect(self.display_chatbot_response)
@@ -348,8 +437,22 @@ class ChatbotApp(QWidget):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.ask_button.setEnabled(True)
-        self.response_label.setText(f"Response:\n{response}")
+        self.question_box.setEnabled(True)
+
+        if self.pending_question and not self.is_error_response(response):
+            self.chat_history.append(("user", self.pending_question))
+            self.chat_history.append(("assistant", response))
+            if len(self.chat_history) > MAX_HISTORY_TURNS * 2:
+                self.chat_history = self.chat_history[-MAX_HISTORY_TURNS * 2 :]
+
+            self.response_label.setText(self.format_chat_history())
+        else:
+            self.response_label.setText(self.format_chat_history(self.pending_question, response))
+
+        self.scroll_response_to_bottom()
+        self.pending_question = ""
         self.ollama_worker = None
+        self.question_box.setFocus()
 
 
 if __name__ == "__main__":
