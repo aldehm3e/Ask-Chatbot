@@ -1,0 +1,66 @@
+LANG_EN = "en"
+LANG_AR = "ar"
+
+
+TRANSLATIONS = {
+    LANG_EN: {
+        "window_title": "Ask Chatbot V1.6",
+        "upload": "Upload PDF(s)",
+        "clear_docs": "Clear Documents",
+        "show_text": "Show Extracted Text",
+        "ask": "Ask",
+        "stop": "Stop",
+        "copy_last": "Copy Last Answer",
+        "export_chat": "Export Chat",
+        "clear_chat": "Clear Chat",
+        "ocr": "OCR scanned pages",
+        "ocr_lang": "OCR language",
+        "model": "Model",
+        "refresh_models": "Refresh Models",
+        "documents": "Documents",
+        "sources": "Sources",
+        "search": "Search extracted text",
+        "question_placeholder": "Type your question. Enter asks, Shift+Enter adds a new line.",
+        "empty_chat": "Upload PDFs or ask a general question to begin.",
+        "ready": "Ready.",
+        "thinking": "Thinking...",
+        "extracting": "Extracting PDF text...",
+        "no_text": "No extracted text is available.",
+        "about": "About",
+        "language": "Language",
+        "english": "English",
+        "arabic": "Arabic",
+    },
+    LANG_AR: {
+        "window_title": "Ask Chatbot V1.6",
+        "upload": "رفع ملفات PDF",
+        "clear_docs": "مسح المستندات",
+        "show_text": "عرض النص المستخرج",
+        "ask": "اسأل",
+        "stop": "إيقاف",
+        "copy_last": "نسخ آخر إجابة",
+        "export_chat": "تصدير المحادثة",
+        "clear_chat": "مسح المحادثة",
+        "ocr": "استخدام OCR للصفحات المصورة",
+        "ocr_lang": "لغة OCR",
+        "model": "النموذج",
+        "refresh_models": "تحديث النماذج",
+        "documents": "المستندات",
+        "sources": "المصادر",
+        "search": "البحث في النص المستخرج",
+        "question_placeholder": "اكتب سؤالك. Enter للإرسال و Shift+Enter لسطر جديد.",
+        "empty_chat": "ارفع ملفات PDF أو اسأل سؤالا عاما للبدء.",
+        "ready": "جاهز.",
+        "thinking": "جار التفكير...",
+        "extracting": "جار استخراج نص PDF...",
+        "no_text": "لا يوجد نص مستخرج.",
+        "about": "حول",
+        "language": "اللغة",
+        "english": "English",
+        "arabic": "العربية",
+    },
+}
+
+
+def tr(language, key):
+    return TRANSLATIONS.get(language, TRANSLATIONS[LANG_EN]).get(key, TRANSLATIONS[LANG_EN].get(key, key))
